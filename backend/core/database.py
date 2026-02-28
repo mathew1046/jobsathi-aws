@@ -149,7 +149,30 @@ CREATE TABLE IF NOT EXISTS applications (
     status          VARCHAR(50) DEFAULT 'applied', -- applied, viewed, shortlisted, rejected, hired
     applied_at      TIMESTAMP DEFAULT NOW(),
     updated_at      TIMESTAMP DEFAULT NOW(),
-    CONSTRAINT uq_applications_worker_job UNIQUE (worker_id, job_id)
+    UNIQUE (worker_id, job_id)   -- prevents duplicate applications; used by ON CONFLICT in create_application()
+);
+
+-- ─── Onboarding Questions Catalogue ──────────────────────────────────────────
+-- Master list of the 20 onboarding questions + all language translations.
+-- Seeded once; read at runtime to pick the right language for each worker.
+
+CREATE TABLE IF NOT EXISTS onboarding_questions (
+    id              SERIAL PRIMARY KEY,
+    question_index  INTEGER UNIQUE NOT NULL,   -- 0-19, matches ONBOARDING_QUESTIONS list
+    field_key       VARCHAR(100) NOT NULL,      -- DB column this answer maps to
+    extraction_hint TEXT NOT NULL,             -- instruction sent to Bedrock for extraction
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- One row per (question, language) pair — 20 questions × 10 languages = 200 rows
+CREATE TABLE IF NOT EXISTS question_translations (
+    id              SERIAL PRIMARY KEY,
+    question_id     INTEGER REFERENCES onboarding_questions(id) ON DELETE CASCADE,
+    language_code   VARCHAR(10) NOT NULL,      -- 'hi', 'ta', 'te', 'mr', 'bn', 'gu', 'kn', 'pa', 'ml', 'en'
+    language_name   VARCHAR(50) NOT NULL,      -- 'Hindi', 'Tamil', etc.
+    question_text   TEXT NOT NULL,             -- the question in that language
+    created_at      TIMESTAMP DEFAULT NOW(),
+    UNIQUE (question_id, language_code)
 );
 
 -- Indexes for fast queries
@@ -178,6 +201,8 @@ ALTER TABLE IF EXISTS applications
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_worker_job_unique
     ON applications(worker_id, job_id);
+CREATE INDEX IF NOT EXISTS idx_qtrans_question ON question_translations(question_id);
+CREATE INDEX IF NOT EXISTS idx_qtrans_language ON question_translations(language_code);
 """
 
 

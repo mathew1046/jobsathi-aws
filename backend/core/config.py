@@ -47,6 +47,12 @@ class Settings:
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
     SECRET_KEY: str = os.getenv("SECRET_KEY", "change-this-in-production")
 
+    # SNS topics for notifications (Application Agent)
+    # Employer notifications — set after creating the SNS topic in AWS console
+    EMPLOYER_NOTIFICATIONS_SNS_ARN: str = os.getenv(
+        "EMPLOYER_NOTIFICATIONS_SNS_ARN", ""
+    )
+
 
 @lru_cache()
 def get_settings() -> Settings:

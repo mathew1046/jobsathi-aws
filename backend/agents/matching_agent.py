@@ -43,8 +43,10 @@ from core.database import (
     upsert_matched_job,
     update_matched_job_status,
     save_application_record,
+    get_worker_profile
 )
 from core.session import save_session
+from agents.application_agent import handle_job_application
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -303,12 +305,41 @@ async def fetch_jobs_adzuna(
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            resp = await client.get(
-                "https://api.adzuna.com/v1/api/jobs/in/search/1",
-                params=params,
+            response = await client.get(
+                "https://api.adzuna.com/v1/api/jobs/in/search/1", params=params
             )
-            resp.raise_for_status()
-            data = resp.json()
+            response.raise_for_status()
+            data = response.json()
+
+            jobs = []
+            for job in data.get("results", []):
+                # Parse salary
+                salary_min = job.get("salary_min")
+                salary_max = job.get("salary_max")
+
+                # Convert annual salary to daily (÷ 300 working days)
+                daily_min = int(salary_min / 300) if salary_min else None
+                daily_max = int(salary_max / 300) if salary_max else None
+
+                jobs.append(
+                    {
+                        "source": "adzuna",
+                        "external_id": job.get("id", ""),
+                        "title": job.get("title", ""),
+                        "company": job.get("company", {}).get("display_name", ""),
+                        "location": job.get("location", {}).get("display_name", ""),
+                        "city": city,
+                        "state": state,
+                        "salary_min": daily_min,
+                        "salary_max": daily_max,
+                        "description": job.get("description", "")[:500],  # truncate
+                        "url": job.get("redirect_url", ""),
+                        "job_type": "full_time",
+                        "fetched_at": datetime.utcnow().isoformat(),
+                    }
+                )
+            return jobs
+
         except httpx.HTTPError as e:
             print(f"Adzuna API error: {e}")
             return []
@@ -381,8 +412,34 @@ async def fetch_jobs_jooble(
                 json=payload,
                 headers={"Content-Type": "application/json"},
             )
-            resp.raise_for_status()
-            data = resp.json()
+            response.raise_for_status()
+            data = response.json()
+
+            jobs = []
+            for job in data.get("jobs", []):
+                # Jooble salary is usually a string like "₹15,000 - ₹25,000"
+                salary_str = job.get("salary", "")
+                salary_min, salary_max = parse_salary_string(salary_str)
+
+                jobs.append(
+                    {
+                        "source": "jooble",
+                        "external_id": job.get("id", ""),
+                        "title": job.get("title", ""),
+                        "company": job.get("company", ""),
+                        "location": job.get("location", ""),
+                        "city": city,
+                        "state": state,
+                        "salary_min": salary_min,
+                        "salary_max": salary_max,
+                        "description": job.get("snippet", "")[:500],
+                        "url": job.get("link", ""),
+                        "job_type": job.get("type", "full_time"),
+                        "fetched_at": datetime.utcnow().isoformat(),
+                    }
+                )
+            return jobs
+
         except httpx.HTTPError as e:
             print(f"Jooble API error: {e}")
             return []
@@ -544,6 +601,17 @@ def _serp_description(job: dict) -> str:
         if items:
             parts.append(f"{title}: " + "; ".join(items[:3]))
     return " | ".join(parts) or job.get("description", "")
+def parse_salary_string(salary_str: str) -> Tuple[Optional[int], Optional[int]]:
+    """Parse salary strings like '₹15,000 - ₹25,000' into (15000, 25000)."""
+    import re
+
+    numbers = re.findall(r"[\d,]+", salary_str.replace(",", ""))
+    if len(numbers) >= 2:
+        return int(numbers[0]), int(numbers[1])
+    elif len(numbers) == 1:
+        val = int(numbers[0])
+        return val, val
+    return None, None
 
 
 # ─── Cache Jobs in RDS ────────────────────────────────────────────────────────
@@ -685,6 +753,7 @@ async def fetch_all_jobs(
 # ─── Spoken Job Description via Bedrock ──────────────────────────────────────
 
 
+
 async def describe_job_in_language(job: dict, language: str, position: int) -> str:
     """
     Uses Bedrock (Claude) to describe a job naturally in the worker's language.
@@ -730,6 +799,7 @@ async def describe_job_in_language(job: dict, language: str, position: int) -> s
             }
         )
         resp = get_bedrock_client().invoke_model(
+        response = bedrock.invoke_model(
             modelId=settings.BEDROCK_MODEL_ID,
             body=body,
             contentType="application/json",
@@ -743,6 +813,7 @@ async def describe_job_in_language(job: dict, language: str, position: int) -> s
 
 
 # ─── Intent Detection ─────────────────────────────────────────────────────────
+
 
 
 async def detect_job_response_intent(text: str, language: str) -> str:
@@ -782,6 +853,7 @@ async def detect_job_response_intent(text: str, language: str) -> str:
             }
         )
         resp = get_bedrock_client().invoke_model(
+        response = bedrock.invoke_model(
             modelId=settings.BEDROCK_MODEL_ID,
             body=body,
             contentType="application/json",
@@ -827,6 +899,19 @@ async def record_application(worker_id: str, job: dict) -> str:
 def _lang_response(language: str, hi_text: str, en_text: str) -> str:
     """Return the Hindi string for 'hi', English otherwise."""
     return hi_text if language == "hi" else en_text
+async def save_application(worker_id: str, job_id: str):
+    """Records that a worker applied to a job."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO applications (worker_id, job_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+        """,
+            worker_id,
+            job_id,
+        )
 
 
 # ─── Main function called by orchestrator ────────────────────────────────────
