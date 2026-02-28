@@ -13,6 +13,7 @@ from functools import lru_cache
 # Set these in your ECS task definition as environment variables,
 # or in a .env file locally for development.
 
+
 class Settings:
     # AWS region — keep everything in the same region to avoid data transfer costs
     AWS_REGION: str = os.getenv("AWS_REGION", "ap-south-1")  # Mumbai — closest to India
@@ -43,6 +44,12 @@ class Settings:
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
     SECRET_KEY: str = os.getenv("SECRET_KEY", "change-this-in-production")
 
+    # SNS topics for notifications (Application Agent)
+    # Employer notifications — set after creating the SNS topic in AWS console
+    EMPLOYER_NOTIFICATIONS_SNS_ARN: str = os.getenv(
+        "EMPLOYER_NOTIFICATIONS_SNS_ARN", ""
+    )
+
 
 @lru_cache()
 def get_settings() -> Settings:
@@ -51,6 +58,7 @@ def get_settings() -> Settings:
 
 # ─── AWS Clients ─────────────────────────────────────────────────────────────
 # Created once at startup. lru_cache ensures they are singletons.
+
 
 @lru_cache()
 def get_transcribe_client():
@@ -66,6 +74,7 @@ def get_transcribe_streaming_client():
     Requires: pip install amazon-transcribe
     """
     from amazon_transcribe.client import TranscribeStreamingClient
+
     return TranscribeStreamingClient(region=get_settings().AWS_REGION)
 
 

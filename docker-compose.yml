@@ -1,0 +1,105 @@
+# docker-compose.yml
+# Local development stack for JobSathi.
+# Starts: FastAPI backend, React frontend dev server, PostgreSQL, Redis.
+#
+# Usage:
+#   cp backend/.env.example backend/.env.local   # fill in API keys
+#   cp frontend/.env.example frontend/.env.local
+#   docker compose up
+#
+# The backend will be at  http://localhost:8000
+# The frontend will be at http://localhost:3000
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       jobsathi
+      POSTGRES_USER:     jobsathi_admin
+      POSTGRES_PASSWORD: localdevpassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobsathi_admin -d jobsathi"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── FastAPI backend ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env.local
+    environment:
+      # Override DB/Redis to point at the local docker services
+      DB_HOST:     postgres
+      DB_PORT:     "5432"
+      DB_NAME:     jobsathi
+      DB_USER:     jobsathi_admin
+      DB_PASSWORD: localdevpassword
+      REDIS_HOST:  redis
+      REDIS_PORT:  "6379"
+      ENVIRONMENT: development
+    volumes:
+      # Hot-reload: mount source code so uvicorn --reload picks up changes
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      uvicorn main:app
+        --host 0.0.0.0
+        --port 8000
+        --reload
+        --reload-dir /app
+
+  # ── React frontend ──────────────────────────────────────────────────────────
+  frontend:
+    image: node:20-alpine
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "3000:3000"
+    env_file:
+      - ./frontend/.env.local
+    environment:
+      # Tell CRA to proxy API requests to the backend container
+      REACT_APP_API_URL: http://localhost:8000
+      # Needed for CRA to bind on all interfaces inside Docker
+      HOST: "0.0.0.0"
+      PORT: "3000"
+      CHOKIDAR_USEPOLLING: "true"   # File-watching works across Docker volumes on Linux
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    depends_on:
+      - backend
+    command: sh -c "npm install && npm start"
+
+volumes:
+  postgres_data:
+  frontend_node_modules:

@@ -130,7 +130,8 @@ CREATE TABLE IF NOT EXISTS applications (
     job_id          UUID REFERENCES jobs_cache(id),
     status          VARCHAR(50) DEFAULT 'applied', -- applied, viewed, shortlisted, rejected
     applied_at      TIMESTAMP DEFAULT NOW(),
-    updated_at      TIMESTAMP DEFAULT NOW()
+    updated_at      TIMESTAMP DEFAULT NOW(),
+    UNIQUE (worker_id, job_id)   -- prevents duplicate applications; used by ON CONFLICT in create_application()
 );
 
 -- Indexes for fast queries
@@ -155,6 +156,7 @@ async def create_all_tables():
 
 # ─── Helper Queries ───────────────────────────────────────────────────────────
 
+
 async def get_or_create_worker(phone_number: str) -> dict:
     """
     Returns existing worker or creates new one.
@@ -165,20 +167,20 @@ async def get_or_create_worker(phone_number: str) -> dict:
         # Try to get existing worker
         row = await conn.fetchrow(
             "SELECT id, phone_number, created_at FROM workers WHERE phone_number = $1",
-            phone_number
+            phone_number,
         )
         if row:
             # Update last_active
             await conn.execute(
                 "UPDATE workers SET last_active = NOW() WHERE phone_number = $1",
-                phone_number
+                phone_number,
             )
             return dict(row)
 
         # Create new worker
         row = await conn.fetchrow(
             "INSERT INTO workers (phone_number) VALUES ($1) RETURNING id, phone_number, created_at",
-            phone_number
+            phone_number,
         )
         return dict(row)
 
@@ -188,8 +190,7 @@ async def get_worker_profile(worker_id: str) -> Optional[dict]:
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM worker_profiles WHERE worker_id = $1",
-            worker_id
+            "SELECT * FROM worker_profiles WHERE worker_id = $1", worker_id
         )
         return dict(row) if row else None
 
@@ -200,7 +201,7 @@ async def save_conversation_turn(
     role: str,
     content: str,
     agent_name: str,
-    audio_s3_key: str = None
+    audio_s3_key: str = None,
 ):
     """
     Saves every single turn to the DB immediately.
@@ -208,26 +209,41 @@ async def save_conversation_turn(
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("""
+        await conn.execute(
+            """
             INSERT INTO conversations
                 (worker_id, session_id, role, content, agent_name, audio_s3_key)
             VALUES ($1, $2, $3, $4, $5, $6)
-        """, worker_id, session_id, role, content, agent_name, audio_s3_key)
+        """,
+            worker_id,
+            session_id,
+            role,
+            content,
+            agent_name,
+            audio_s3_key,
+        )
 
 
-async def get_recent_conversation(worker_id: str, session_id: str, limit: int = 10) -> list:
+async def get_recent_conversation(
+    worker_id: str, session_id: str, limit: int = 10
+) -> list:
     """
     Loads the last N turns of a conversation for context.
     Bedrock needs conversation history to maintain context.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(
+            """
             SELECT role, content, agent_name, created_at
             FROM conversations
             WHERE worker_id = $1 AND session_id = $2
             ORDER BY created_at DESC
             LIMIT $3
-        """, worker_id, session_id, limit)
+        """,
+            worker_id,
+            session_id,
+            limit,
+        )
         # Return in chronological order (oldest first)
         return [dict(r) for r in reversed(rows)]

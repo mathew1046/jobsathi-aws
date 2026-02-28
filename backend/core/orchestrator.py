@@ -19,17 +19,16 @@ from core.session import get_session, create_new_session, save_session
 from core.database import (
     get_or_create_worker,
     get_worker_profile,
-    save_conversation_turn
+    save_conversation_turn,
 )
 from agents.voice_agent import process_voice_input, generate_voice_response
 from agents.onboarding_agent import handle_onboarding_message
 from agents.matching_agent import handle_matching_message
+from agents.application_agent import get_application_status_summary
 
 
 async def process_message(
-    audio_bytes: bytes,
-    phone_number: str,
-    session_id: str = None
+    audio_bytes: bytes, phone_number: str, session_id: str = None
 ) -> dict:
     """
     The single entry point for ALL user messages.
@@ -67,19 +66,34 @@ async def process_message(
         existing_profile = await get_worker_profile(worker_id)
         if existing_profile and existing_profile.get("questions_answered", 0) > 0:
             # Resume from where they left off
-            session["onboarding"]["questions_answered"] = existing_profile["questions_answered"]
-            session["onboarding"]["current_question_index"] = existing_profile["questions_answered"]
+            session["onboarding"]["questions_answered"] = existing_profile[
+                "questions_answered"
+            ]
+            session["onboarding"]["current_question_index"] = existing_profile[
+                "questions_answered"
+            ]
 
             # Restore collected data from DB into session
             profile_fields = [
-                "primary_skill", "secondary_skills", "years_experience",
-                "city", "district", "state", "willing_to_relocate",
-                "max_travel_km", "availability", "expected_daily_wage",
-                "work_type", "name", "skill_description"
+                "primary_skill",
+                "secondary_skills",
+                "years_experience",
+                "city",
+                "district",
+                "state",
+                "willing_to_relocate",
+                "max_travel_km",
+                "availability",
+                "expected_daily_wage",
+                "work_type",
+                "name",
+                "skill_description",
             ]
             for field in profile_fields:
                 if existing_profile.get(field) is not None:
-                    session["onboarding"]["collected_data"][field] = existing_profile[field]
+                    session["onboarding"]["collected_data"][field] = existing_profile[
+                        field
+                    ]
 
             if existing_profile.get("profile_complete"):
                 session["current_agent"] = "matching"
@@ -95,9 +109,11 @@ async def process_message(
     user_audio_s3_key = None
 
     if audio_bytes and len(audio_bytes) > 100:  # ignore empty audio
-        transcribed_text, detected_language, user_audio_s3_key = await process_voice_input(
-            audio_bytes, language, worker_id
-        )
+        (
+            transcribed_text,
+            detected_language,
+            user_audio_s3_key,
+        ) = await process_voice_input(audio_bytes, language, worker_id)
 
         # Update language in session if detected language changed
         if detected_language and detected_language != language:
@@ -108,8 +124,12 @@ async def process_message(
     # Save the user's turn to DB immediately
     if transcribed_text:
         await save_conversation_turn(
-            worker_id, session_id, "user", transcribed_text,
-            session["current_agent"], user_audio_s3_key
+            worker_id,
+            session_id,
+            "user",
+            transcribed_text,
+            session["current_agent"],
+            user_audio_s3_key,
         )
 
     # ── Step 4: Route to correct agent ───────────────────────────────────────
@@ -135,8 +155,12 @@ async def process_message(
 
     # ── Step 6: Save agent's response to DB ──────────────────────────────────
     await save_conversation_turn(
-        worker_id, session_id, "assistant", response_text,
-        current_agent, agent_audio_s3_key
+        worker_id,
+        session_id,
+        "assistant",
+        response_text,
+        current_agent,
+        agent_audio_s3_key,
     )
 
     # ── Step 7: Save updated session to Redis ─────────────────────────────────
@@ -155,7 +179,7 @@ async def process_message(
         "progress": {
             "questions_answered": questions_answered,
             "total": 20,
-            "percent": int((questions_answered / 20) * 100)
+            "percent": int((questions_answered / 20) * 100),
         },
         "profile_complete": onboarding_state.get("complete", False),
         "transcribed_input": transcribed_text,  # helpful for debugging
