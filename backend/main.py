@@ -214,6 +214,12 @@ async def get_matched_jobs(phone_number: str, status: str = None):
     The matched_jobs table is the permanent record — it survives Redis session
     expiry, so workers can always see their job history even after a browser refresh.
     """
+    if status is not None and status not in VALID_JOB_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status '{status}'. Must be one of: {', '.join(sorted(VALID_JOB_STATUSES))}",
+        )
+
     if not phone_number.startswith("+"):
         phone_number = "+91" + phone_number.lstrip("0")
 

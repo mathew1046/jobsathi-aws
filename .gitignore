@@ -1,3 +1,6 @@
+backend/__pycache__
+backend/agents/__pycache__
+backend/core/__pycache__
 __pycache__/
 *.pyc
 *.pyo

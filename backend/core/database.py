@@ -205,12 +205,30 @@ CREATE INDEX IF NOT EXISTS idx_qtrans_question ON question_translations(question
 CREATE INDEX IF NOT EXISTS idx_qtrans_language ON question_translations(language_code);
 """
 
+# Migration SQL for existing deployments: add new columns/indexes not covered by CREATE TABLE IF NOT EXISTS
+MIGRATE_SQL = """
+-- jobs_cache: add search_skill column and unique index on (source, external_id) if missing
+ALTER TABLE IF EXISTS jobs_cache
+    ADD COLUMN IF NOT EXISTS search_skill VARCHAR(100);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_cache_source_external
+    ON jobs_cache (source, external_id);
+
+-- applications: add matched_job_id column and unique index on (worker_id, job_id) if missing
+ALTER TABLE IF EXISTS applications
+    ADD COLUMN IF NOT EXISTS matched_job_id UUID REFERENCES matched_jobs(id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_worker_job_unique
+    ON applications(worker_id, job_id);
+"""
+
 
 async def create_all_tables():
     """Run once on app startup to create all tables if they don't exist."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(CREATE_TABLES_SQL)
+        await conn.execute(MIGRATE_SQL)
     print("✓ Database tables ready")
 
 
