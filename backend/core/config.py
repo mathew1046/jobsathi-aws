@@ -39,6 +39,9 @@ class Settings:
     ADZUNA_APP_ID: str = os.getenv("ADZUNA_APP_ID", "")
     ADZUNA_API_KEY: str = os.getenv("ADZUNA_API_KEY", "")
     JOOBLE_API_KEY: str = os.getenv("JOOBLE_API_KEY", "")
+    # SerpAPI — Google Jobs search (https://serpapi.com/google-jobs-api)
+    # Free tier: 100 searches/month. Paid plans from $50/month.
+    SERP_API_KEY: str = os.getenv("SERP_API_KEY", "")
 
     # App
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")

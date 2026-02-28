@@ -103,32 +103,50 @@ CREATE TABLE IF NOT EXISTS conversations (
     created_at      TIMESTAMP DEFAULT NOW()
 );
 
--- Jobs cache: results from Jooble/Adzuna saved locally to avoid repeated API calls
+-- Jobs cache: results from Jooble/Adzuna/SerpAPI saved locally to avoid repeated API calls
 CREATE TABLE IF NOT EXISTS jobs_cache (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     external_id     VARCHAR(255),                  -- ID from the source API
-    source          VARCHAR(50) NOT NULL,           -- "adzuna", "jooble"
+    source          VARCHAR(50) NOT NULL,           -- "adzuna", "jooble", "serp"
     title           VARCHAR(255) NOT NULL,
     company         VARCHAR(255),
     location        VARCHAR(255),
     city            VARCHAR(100),
     state           VARCHAR(100),
-    salary_min      INTEGER,
-    salary_max      INTEGER,
+    salary_min      INTEGER,                       -- daily rate in INR
+    salary_max      INTEGER,                       -- daily rate in INR
     description     TEXT,
     url             VARCHAR(500),
     skills_required TEXT[],
     job_type        VARCHAR(50),                   -- "full_time", "contract", "daily"
+    search_skill    VARCHAR(100),                  -- the skill term used to find this job
     fetched_at      TIMESTAMP DEFAULT NOW(),
-    expires_at      TIMESTAMP                      -- cache for 24 hours
+    expires_at      TIMESTAMP,                     -- cache for 24 hours
+    -- Unique constraint prevents duplicate jobs across re-fetches
+    CONSTRAINT uq_jobs_source_external UNIQUE (source, external_id)
 );
 
--- Applications: worker applied to a job
+-- Matched jobs: persistent record of which jobs were shown/applied to by each worker
+-- This survives Redis session expiry and is the source of truth for the employer side
+CREATE TABLE IF NOT EXISTS matched_jobs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    worker_id       UUID REFERENCES workers(id) ON DELETE CASCADE,
+    job_id          UUID REFERENCES jobs_cache(id) ON DELETE CASCADE,
+    match_score     SMALLINT DEFAULT 0,            -- 0-100, higher = better match
+    status          VARCHAR(50) DEFAULT 'shown',   -- shown, interested, applied, rejected, hired
+    shown_at        TIMESTAMP DEFAULT NOW(),
+    acted_at        TIMESTAMP,                     -- when worker said yes/no
+    notes           TEXT,
+    CONSTRAINT uq_matched_worker_job UNIQUE (worker_id, job_id)
+);
+
+-- Applications: worker formally applied to a job (subset of matched_jobs with status=applied)
 CREATE TABLE IF NOT EXISTS applications (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     worker_id       UUID REFERENCES workers(id) ON DELETE CASCADE,
     job_id          UUID REFERENCES jobs_cache(id),
-    status          VARCHAR(50) DEFAULT 'applied', -- applied, viewed, shortlisted, rejected
+    matched_job_id  UUID REFERENCES matched_jobs(id),
+    status          VARCHAR(50) DEFAULT 'applied', -- applied, viewed, shortlisted, rejected, hired
     applied_at      TIMESTAMP DEFAULT NOW(),
     updated_at      TIMESTAMP DEFAULT NOW(),
     UNIQUE (worker_id, job_id)   -- prevents duplicate applications; used by ON CONFLICT in create_application()
@@ -165,9 +183,43 @@ CREATE INDEX IF NOT EXISTS idx_profiles_city ON worker_profiles(city);
 CREATE INDEX IF NOT EXISTS idx_conversations_worker ON conversations(worker_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_city ON jobs_cache(city);
+CREATE INDEX IF NOT EXISTS idx_jobs_skill ON jobs_cache(search_skill);
+CREATE INDEX IF NOT EXISTS idx_jobs_expires ON jobs_cache(expires_at);
+CREATE INDEX IF NOT EXISTS idx_matched_worker ON matched_jobs(worker_id);
+CREATE INDEX IF NOT EXISTS idx_matched_status ON matched_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_applications_worker ON applications(worker_id);
+
+-- Migrations: ensure new columns and constraints exist on pre-existing deployments
+ALTER TABLE IF EXISTS jobs_cache
+    ADD COLUMN IF NOT EXISTS search_skill VARCHAR(100);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_cache_source_external
+    ON jobs_cache (source, external_id);
+
+ALTER TABLE IF EXISTS applications
+    ADD COLUMN IF NOT EXISTS matched_job_id UUID REFERENCES matched_jobs(id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_worker_job_unique
+    ON applications(worker_id, job_id);
 CREATE INDEX IF NOT EXISTS idx_qtrans_question ON question_translations(question_id);
 CREATE INDEX IF NOT EXISTS idx_qtrans_language ON question_translations(language_code);
+"""
+
+# Migration SQL for existing deployments: add new columns/indexes not covered by CREATE TABLE IF NOT EXISTS
+MIGRATE_SQL = """
+-- jobs_cache: add search_skill column and unique index on (source, external_id) if missing
+ALTER TABLE IF EXISTS jobs_cache
+    ADD COLUMN IF NOT EXISTS search_skill VARCHAR(100);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_cache_source_external
+    ON jobs_cache (source, external_id);
+
+-- applications: add matched_job_id column and unique index on (worker_id, job_id) if missing
+ALTER TABLE IF EXISTS applications
+    ADD COLUMN IF NOT EXISTS matched_job_id UUID REFERENCES matched_jobs(id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_worker_job_unique
+    ON applications(worker_id, job_id);
 """
 
 
@@ -176,6 +228,7 @@ async def create_all_tables():
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(CREATE_TABLES_SQL)
+        await conn.execute(MIGRATE_SQL)
     print("✓ Database tables ready")
 
 
@@ -274,56 +327,164 @@ async def get_recent_conversation(
         return [dict(r) for r in reversed(rows)]
 
 
-async def get_question_text(question_index: int, language_code: str) -> Optional[str]:
+# ─── Matched Jobs Helpers ─────────────────────────────────────────────────────
+
+
+async def upsert_matched_job(
+    worker_id: str,
+    job_id: str,
+    match_score: int = 0,
+    status: str = "shown",
+) -> str:
     """
-    Fetches the translated question text from the question_translations table.
-    Falls back to English if the requested language is not found.
-    Falls back to None if the question_index doesn't exist at all.
+    Insert or update a worker-job match record.
+    Returns the matched_jobs row id.
+
+    Uses ON CONFLICT so it is safe to call repeatedly:
+    - If the worker has already been shown this job, the score is refreshed
+      but the status is NOT downgraded (applied/hired status is preserved).
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT qt.question_text
-            FROM question_translations qt
-            JOIN onboarding_questions oq ON oq.id = qt.question_id
-            WHERE oq.question_index = $1 AND qt.language_code = $2
+            INSERT INTO matched_jobs (worker_id, job_id, match_score, status)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (worker_id, job_id) DO UPDATE
+                SET match_score = EXCLUDED.match_score,
+                    status = CASE
+                        WHEN matched_jobs.status IN ('applied', 'hired') THEN matched_jobs.status
+                        ELSE EXCLUDED.status
+                    END
+            RETURNING id
             """,
-            question_index,
-            language_code,
+            worker_id,
+            job_id,
+            match_score,
+            status,
         )
-        if row:
-            return row["question_text"]
+        return str(row["id"])
 
-        # Fallback to English
-        row = await conn.fetchrow(
+
+async def update_matched_job_status(worker_id: str, job_id: str, status: str):
+    """Update the status of a worker-job match (e.g., 'interested', 'applied', 'rejected')."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
             """
-            SELECT qt.question_text
-            FROM question_translations qt
-            JOIN onboarding_questions oq ON oq.id = qt.question_id
-            WHERE oq.question_index = $1 AND qt.language_code = 'en'
+            UPDATE matched_jobs
+            SET status = $1, acted_at = NOW()
+            WHERE worker_id = $2 AND job_id = $3
             """,
-            question_index,
+            status,
+            worker_id,
+            job_id,
         )
-        return row["question_text"] if row else None
 
 
-async def get_all_questions_for_language(language_code: str) -> list:
+async def save_application_record(
+    worker_id: str,
+    job_id: str,
+    matched_job_id: str = None,
+):
     """
-    Returns all 20 questions in the requested language, ordered by question_index.
-    Used by tests and the onboarding agent to pre-load the question set.
+    Records a formal application in the applications table.
+    Also updates matched_jobs.status → 'applied'.
+    Idempotent — safe to call multiple times for the same worker+job.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
+        await conn.execute(
             """
-            SELECT oq.question_index, oq.field_key, oq.extraction_hint,
-                   qt.question_text, qt.language_code
-            FROM onboarding_questions oq
-            JOIN question_translations qt
-              ON oq.id = qt.question_id AND qt.language_code = $1
-            ORDER BY oq.question_index
+            INSERT INTO applications (worker_id, job_id, matched_job_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (worker_id, job_id) DO NOTHING
             """,
-            language_code,
+            worker_id,
+            job_id,
+            matched_job_id,
         )
+        # Keep matched_jobs in sync
+        await conn.execute(
+            """
+            UPDATE matched_jobs
+            SET status = 'applied', acted_at = NOW()
+            WHERE worker_id = $1 AND job_id = $2
+            """,
+            worker_id,
+            job_id,
+        )
+
+
+async def get_matched_jobs_for_worker(
+    worker_id: str,
+    status_filter: str = None,
+    limit: int = 20,
+) -> list:
+    """
+    Returns a worker's matched/shown jobs with full job details joined in.
+    Used by the /api/jobs/{phone} endpoint so the frontend can display matches.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if status_filter:
+            rows = await conn.fetch(
+                """
+                SELECT mj.id            AS match_id,
+                       mj.match_score,
+                       mj.status        AS match_status,
+                       mj.shown_at,
+                       mj.acted_at,
+                       jc.id            AS job_id,
+                       jc.title,
+                       jc.company,
+                       jc.location,
+                       jc.city,
+                       jc.state,
+                       jc.salary_min,
+                       jc.salary_max,
+                       jc.description,
+                       jc.url,
+                       jc.source,
+                       jc.job_type
+                FROM   matched_jobs mj
+                JOIN   jobs_cache   jc ON jc.id = mj.job_id
+                WHERE  mj.worker_id = $1
+                  AND  mj.status    = $2
+                ORDER  BY mj.match_score DESC, mj.shown_at DESC
+                LIMIT  $3
+                """,
+                worker_id,
+                status_filter,
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT mj.id            AS match_id,
+                       mj.match_score,
+                       mj.status        AS match_status,
+                       mj.shown_at,
+                       mj.acted_at,
+                       jc.id            AS job_id,
+                       jc.title,
+                       jc.company,
+                       jc.location,
+                       jc.city,
+                       jc.state,
+                       jc.salary_min,
+                       jc.salary_max,
+                       jc.description,
+                       jc.url,
+                       jc.source,
+                       jc.job_type
+                FROM   matched_jobs mj
+                JOIN   jobs_cache   jc ON jc.id = mj.job_id
+                WHERE  mj.worker_id = $1
+                ORDER  BY mj.match_score DESC, mj.shown_at DESC
+                LIMIT  $2
+                """,
+                worker_id,
+                limit,
+            )
         return [dict(r) for r in rows]
