@@ -22,7 +22,6 @@ from core.database import (
     get_or_create_worker,
     get_worker_profile,
     get_matched_jobs_for_worker,
-    get_pool,
 )
 from core.session import get_session
 from core.orchestrator import process_message
@@ -196,6 +195,9 @@ async def get_resume_url(phone_number: str):
 # ─── Matched Jobs Endpoint ────────────────────────────────────────────────────
 
 
+VALID_JOB_STATUSES = {"shown", "interested", "applied", "rejected", "hired"}
+
+
 @app.get("/api/jobs/{phone_number}")
 async def get_matched_jobs(phone_number: str, status: str = None):
     """
@@ -214,6 +216,12 @@ async def get_matched_jobs(phone_number: str, status: str = None):
     """
     if not phone_number.startswith("+"):
         phone_number = "+91" + phone_number.lstrip("0")
+
+    if status is not None and status not in VALID_JOB_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status '{status}'. Must be one of: {', '.join(sorted(VALID_JOB_STATUSES))}",
+        )
 
     worker = await get_or_create_worker(phone_number)
     worker_id = str(worker["id"])

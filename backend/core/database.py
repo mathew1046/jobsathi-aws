@@ -188,6 +188,19 @@ CREATE INDEX IF NOT EXISTS idx_jobs_expires ON jobs_cache(expires_at);
 CREATE INDEX IF NOT EXISTS idx_matched_worker ON matched_jobs(worker_id);
 CREATE INDEX IF NOT EXISTS idx_matched_status ON matched_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_applications_worker ON applications(worker_id);
+
+-- Migrations: ensure new columns and constraints exist on pre-existing deployments
+ALTER TABLE IF EXISTS jobs_cache
+    ADD COLUMN IF NOT EXISTS search_skill VARCHAR(100);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_cache_source_external
+    ON jobs_cache (source, external_id);
+
+ALTER TABLE IF EXISTS applications
+    ADD COLUMN IF NOT EXISTS matched_job_id UUID REFERENCES matched_jobs(id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_worker_job_unique
+    ON applications(worker_id, job_id);
 CREATE INDEX IF NOT EXISTS idx_qtrans_question ON question_translations(question_id);
 CREATE INDEX IF NOT EXISTS idx_qtrans_language ON question_translations(language_code);
 """
