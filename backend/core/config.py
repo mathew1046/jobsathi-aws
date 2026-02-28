@@ -13,6 +13,7 @@ from functools import lru_cache
 # Set these in your ECS task definition as environment variables,
 # or in a .env file locally for development.
 
+
 class Settings:
     # AWS region — keep everything in the same region to avoid data transfer costs
     AWS_REGION: str = os.getenv("AWS_REGION", "ap-south-1")  # Mumbai — closest to India
@@ -38,6 +39,9 @@ class Settings:
     ADZUNA_APP_ID: str = os.getenv("ADZUNA_APP_ID", "")
     ADZUNA_API_KEY: str = os.getenv("ADZUNA_API_KEY", "")
     JOOBLE_API_KEY: str = os.getenv("JOOBLE_API_KEY", "")
+    # SerpAPI — Google Jobs search (https://serpapi.com/google-jobs-api)
+    # Free tier: 100 searches/month. Paid plans from $50/month.
+    SERP_API_KEY: str = os.getenv("SERP_API_KEY", "")
 
     # App
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
@@ -51,6 +55,7 @@ def get_settings() -> Settings:
 
 # ─── AWS Clients ─────────────────────────────────────────────────────────────
 # Created once at startup. lru_cache ensures they are singletons.
+
 
 @lru_cache()
 def get_transcribe_client():
@@ -66,6 +71,7 @@ def get_transcribe_streaming_client():
     Requires: pip install amazon-transcribe
     """
     from amazon_transcribe.client import TranscribeStreamingClient
+
     return TranscribeStreamingClient(region=get_settings().AWS_REGION)
 
 
