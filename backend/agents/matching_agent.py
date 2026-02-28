@@ -618,6 +618,17 @@ async def cache_jobs(jobs: List[dict]) -> List[dict]:
 
     async with pool.acquire() as conn:
         for job in jobs:
+            # Generate a stable fingerprint when the upstream API provides no id,
+            # so different jobs from the same source don't collide on external_id="".
+            external_id = job.get("external_id") or ""
+            if not external_id:
+                raw = json.dumps([
+                    job.get("source", ""),
+                    job.get("title", ""),
+                    job.get("company", ""),
+                    job.get("location", ""),
+                ], sort_keys=True)
+                external_id = hashlib.sha256(raw.encode()).hexdigest()[:24]
             row = await conn.fetchrow(
                 """
                 INSERT INTO jobs_cache
@@ -635,7 +646,7 @@ async def cache_jobs(jobs: List[dict]) -> List[dict]:
                     fetched_at  = NOW()
                 RETURNING id
                 """,
-                job["external_id"],
+                external_id,
                 job["source"],
                 job["title"],
                 job.get("company", ""),
@@ -662,11 +673,14 @@ async def get_cached_jobs(skill: str, city: str, state: str = "") -> List[dict]:
     Returns non-expired cached jobs for this skill+city (or skill+state) combination.
     Ordered by most recently fetched so the freshest results come first.
     """
+    location_clause = city or state
+    if not location_clause:
+        return []
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         skill_term = skill.replace("_", " ")
         alt_term = SKILL_TO_SEARCH_TERMS.get(skill, [skill_term])[0]
-        location_clause = city or state
 
         rows = await conn.fetch(
             """
@@ -699,7 +713,7 @@ async def fetch_all_jobs(
     Fetch jobs from all three APIs concurrently.
     If city returns fewer than MIN_RESULTS, automatically re-runs at state level.
 
-    Returns a deduplicated, scored list sorted by match_score descending.
+    Returns a deduplicated list of jobs from all sources (order not guaranteed).
     """
     # ── City-level fetch ──
     adzuna_t = fetch_jobs_adzuna(skill, city, state, min_wage)
@@ -782,8 +796,7 @@ async def describe_job_in_language(job: dict, language: str, position: int) -> s
                 "messages": [{"role": "user", "content": prompt}],
             }
         )
-        resp = get_bedrock_client().invoke_model(
-        response = bedrock.invoke_model(
+        resp = bedrock.invoke_model(
             modelId=settings.BEDROCK_MODEL_ID,
             body=body,
             contentType="application/json",
@@ -836,8 +849,7 @@ async def detect_job_response_intent(text: str, language: str) -> str:
                 "messages": [{"role": "user", "content": prompt}],
             }
         )
-        resp = get_bedrock_client().invoke_model(
-        response = bedrock.invoke_model(
+        resp = bedrock.invoke_model(
             modelId=settings.BEDROCK_MODEL_ID,
             body=body,
             contentType="application/json",
@@ -1046,7 +1058,6 @@ async def handle_matching_message(
         # Give more detail about the current job, then ask again
         desc = shown_job.get("description", "")
         company = shown_job.get("company", "")
-        url = shown_job.get("url", "")
         sal_min = shown_job.get("salary_min")
         sal_max = shown_job.get("salary_max")
 
