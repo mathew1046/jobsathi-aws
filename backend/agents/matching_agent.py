@@ -23,8 +23,9 @@ import httpx
 from datetime import datetime, timedelta
 from typing import List, Tuple, Optional
 from core.config import settings, get_bedrock_client
-from core.database import get_pool
+from core.database import get_pool, get_worker_profile
 from core.session import save_session
+from agents.application_agent import handle_job_application
 
 
 # ─── Skill → Search Query Mapping ────────────────────────────────────────────
@@ -62,12 +63,9 @@ STATE_TO_ADZUNA_LOCATION = {
 
 # ─── Adzuna API ───────────────────────────────────────────────────────────────
 
+
 async def fetch_jobs_adzuna(
-    skill: str,
-    city: str,
-    state: str,
-    min_salary: int = None,
-    limit: int = 10
+    skill: str, city: str, state: str, min_salary: int = None, limit: int = 10
 ) -> List[dict]:
     """
     Fetch jobs from Adzuna API.
@@ -100,8 +98,7 @@ async def fetch_jobs_adzuna(
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             response = await client.get(
-                "https://api.adzuna.com/v1/api/jobs/in/search/1",
-                params=params
+                "https://api.adzuna.com/v1/api/jobs/in/search/1", params=params
             )
             response.raise_for_status()
             data = response.json()
@@ -116,21 +113,23 @@ async def fetch_jobs_adzuna(
                 daily_min = int(salary_min / 300) if salary_min else None
                 daily_max = int(salary_max / 300) if salary_max else None
 
-                jobs.append({
-                    "source": "adzuna",
-                    "external_id": job.get("id", ""),
-                    "title": job.get("title", ""),
-                    "company": job.get("company", {}).get("display_name", ""),
-                    "location": job.get("location", {}).get("display_name", ""),
-                    "city": city,
-                    "state": state,
-                    "salary_min": daily_min,
-                    "salary_max": daily_max,
-                    "description": job.get("description", "")[:500],  # truncate
-                    "url": job.get("redirect_url", ""),
-                    "job_type": "full_time",
-                    "fetched_at": datetime.utcnow().isoformat(),
-                })
+                jobs.append(
+                    {
+                        "source": "adzuna",
+                        "external_id": job.get("id", ""),
+                        "title": job.get("title", ""),
+                        "company": job.get("company", {}).get("display_name", ""),
+                        "location": job.get("location", {}).get("display_name", ""),
+                        "city": city,
+                        "state": state,
+                        "salary_min": daily_min,
+                        "salary_max": daily_max,
+                        "description": job.get("description", "")[:500],  # truncate
+                        "url": job.get("redirect_url", ""),
+                        "job_type": "full_time",
+                        "fetched_at": datetime.utcnow().isoformat(),
+                    }
+                )
             return jobs
 
         except httpx.HTTPError as e:
@@ -140,11 +139,9 @@ async def fetch_jobs_adzuna(
 
 # ─── Jooble API ───────────────────────────────────────────────────────────────
 
+
 async def fetch_jobs_jooble(
-    skill: str,
-    city: str,
-    state: str,
-    limit: int = 10
+    skill: str, city: str, state: str, limit: int = 10
 ) -> List[dict]:
     """
     Fetch jobs from Jooble API.
@@ -174,7 +171,7 @@ async def fetch_jobs_jooble(
             response = await client.post(
                 f"https://jooble.org/api/{settings.JOOBLE_API_KEY}",
                 json=payload,
-                headers={"Content-Type": "application/json"}
+                headers={"Content-Type": "application/json"},
             )
             response.raise_for_status()
             data = response.json()
@@ -185,21 +182,23 @@ async def fetch_jobs_jooble(
                 salary_str = job.get("salary", "")
                 salary_min, salary_max = parse_salary_string(salary_str)
 
-                jobs.append({
-                    "source": "jooble",
-                    "external_id": job.get("id", ""),
-                    "title": job.get("title", ""),
-                    "company": job.get("company", ""),
-                    "location": job.get("location", ""),
-                    "city": city,
-                    "state": state,
-                    "salary_min": salary_min,
-                    "salary_max": salary_max,
-                    "description": job.get("snippet", "")[:500],
-                    "url": job.get("link", ""),
-                    "job_type": job.get("type", "full_time"),
-                    "fetched_at": datetime.utcnow().isoformat(),
-                })
+                jobs.append(
+                    {
+                        "source": "jooble",
+                        "external_id": job.get("id", ""),
+                        "title": job.get("title", ""),
+                        "company": job.get("company", ""),
+                        "location": job.get("location", ""),
+                        "city": city,
+                        "state": state,
+                        "salary_min": salary_min,
+                        "salary_max": salary_max,
+                        "description": job.get("snippet", "")[:500],
+                        "url": job.get("link", ""),
+                        "job_type": job.get("type", "full_time"),
+                        "fetched_at": datetime.utcnow().isoformat(),
+                    }
+                )
             return jobs
 
         except httpx.HTTPError as e:
@@ -210,7 +209,8 @@ async def fetch_jobs_jooble(
 def parse_salary_string(salary_str: str) -> Tuple[Optional[int], Optional[int]]:
     """Parse salary strings like '₹15,000 - ₹25,000' into (15000, 25000)."""
     import re
-    numbers = re.findall(r'[\d,]+', salary_str.replace(',', ''))
+
+    numbers = re.findall(r"[\d,]+", salary_str.replace(",", ""))
     if len(numbers) >= 2:
         return int(numbers[0]), int(numbers[1])
     elif len(numbers) == 1:
@@ -220,6 +220,7 @@ def parse_salary_string(salary_str: str) -> Tuple[Optional[int], Optional[int]]:
 
 
 # ─── Cache Jobs in RDS ────────────────────────────────────────────────────────
+
 
 async def cache_jobs(jobs: List[dict]):
     """
@@ -235,17 +236,27 @@ async def cache_jobs(jobs: List[dict]):
 
     async with pool.acquire() as conn:
         for job in jobs:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO jobs_cache
                     (external_id, source, title, company, location, city, state,
                      salary_min, salary_max, description, url, job_type, expires_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 ON CONFLICT DO NOTHING
             """,
-                job["external_id"], job["source"], job["title"], job["company"],
-                job["location"], job["city"], job["state"],
-                job["salary_min"], job["salary_max"], job["description"],
-                job["url"], job["job_type"], expires_at
+                job["external_id"],
+                job["source"],
+                job["title"],
+                job["company"],
+                job["location"],
+                job["city"],
+                job["state"],
+                job["salary_min"],
+                job["salary_max"],
+                job["description"],
+                job["url"],
+                job["job_type"],
+                expires_at,
             )
 
 
@@ -253,21 +264,24 @@ async def get_cached_jobs(skill: str, city: str) -> List[dict]:
     """Returns non-expired cached jobs for this skill+city combination."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(
+            """
             SELECT * FROM jobs_cache
             WHERE city ILIKE $1
             AND (title ILIKE $2 OR title ILIKE $3)
             AND (expires_at IS NULL OR expires_at > NOW())
             ORDER BY fetched_at DESC
             LIMIT 15
-        """, f"%{city}%",
+        """,
+            f"%{city}%",
             f"%{skill.replace('_', ' ')}%",
-            f"%{SKILL_TO_SEARCH_TERMS.get(skill, [skill])[0]}%"
+            f"%{SKILL_TO_SEARCH_TERMS.get(skill, [skill])[0]}%",
         )
         return [dict(r) for r in rows]
 
 
 # ─── Job Description for Voice ────────────────────────────────────────────────
+
 
 async def describe_job_in_language(job: dict, language: str, position: int) -> str:
     """
@@ -281,7 +295,9 @@ async def describe_job_in_language(job: dict, language: str, position: int) -> s
     salary_info = ""
     if job.get("salary_min"):
         if job.get("salary_max") and job["salary_max"] != job["salary_min"]:
-            salary_info = f"Salary: ₹{job['salary_min']} to ₹{job['salary_max']} per day"
+            salary_info = (
+                f"Salary: ₹{job['salary_min']} to ₹{job['salary_max']} per day"
+            )
         else:
             salary_info = f"Salary: ₹{job['salary_min']} per day"
 
@@ -289,29 +305,31 @@ async def describe_job_in_language(job: dict, language: str, position: int) -> s
 Keep it under 3 sentences. Sound like a helpful friend, not a job portal.
 
 Job details:
-- Title: {job.get('title', '')}
-- Company: {job.get('company', '') or 'a local company'}
-- Location: {job.get('location', '')}
+- Title: {job.get("title", "")}
+- Company: {job.get("company", "") or "a local company"}
+- Location: {job.get("location", "")}
 - {salary_info}
-- Type: {job.get('job_type', 'regular work')}
-- Brief: {job.get('description', '')[:200]}
+- Type: {job.get("job_type", "regular work")}
+- Brief: {job.get("description", "")[:200]}
 
 This is option number {position} for the worker.
 End by asking: "Kya aap is kaam mein interested hain?" (or equivalent in their language)
 Language code: {language}"""
 
     def call_bedrock():
-        body = json.dumps({
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 200,
-            "temperature": 0.6,
-            "messages": [{"role": "user", "content": prompt}]
-        })
+        body = json.dumps(
+            {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 200,
+                "temperature": 0.6,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+        )
         response = bedrock.invoke_model(
             modelId=settings.BEDROCK_MODEL_ID,
             body=body,
             contentType="application/json",
-            accept="application/json"
+            accept="application/json",
         )
         result = json.loads(response["body"].read())
         return result["content"][0]["text"].strip()
@@ -321,6 +339,7 @@ Language code: {language}"""
 
 
 # ─── Intent Detection for Matching Agent ─────────────────────────────────────
+
 
 async def detect_job_response_intent(text: str, language: str) -> str:
     """
@@ -349,17 +368,19 @@ Return ONLY one of these words: yes, no, details, stop, other
 - "other" = asking an unrelated question or unclear"""
 
     def call_bedrock():
-        body = json.dumps({
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 10,
-            "temperature": 0.0,
-            "messages": [{"role": "user", "content": prompt}]
-        })
+        body = json.dumps(
+            {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 10,
+                "temperature": 0.0,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+        )
         response = bedrock.invoke_model(
             modelId=settings.BEDROCK_MODEL_ID,
             body=body,
             contentType="application/json",
-            accept="application/json"
+            accept="application/json",
         )
         result = json.loads(response["body"].read())
         return result["content"][0]["text"].strip().lower()
@@ -371,24 +392,27 @@ Return ONLY one of these words: yes, no, details, stop, other
 
 # ─── Save Application ─────────────────────────────────────────────────────────
 
+
 async def save_application(worker_id: str, job_id: str):
     """Records that a worker applied to a job."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("""
+        await conn.execute(
+            """
             INSERT INTO applications (worker_id, job_id)
             VALUES ($1, $2)
             ON CONFLICT DO NOTHING
-        """, worker_id, job_id)
+        """,
+            worker_id,
+            job_id,
+        )
 
 
 # ─── Main function called by orchestrator ────────────────────────────────────
 
+
 async def handle_matching_message(
-    text: str,
-    session: dict,
-    worker_id: str,
-    phone_number: str
+    text: str, session: dict, worker_id: str, phone_number: str
 ) -> Tuple[str, dict]:
     """
     Main entry point for the job matching agent.
@@ -412,7 +436,6 @@ async def handle_matching_message(
 
     # ── Case 1: No active search yet, fetch jobs ──
     if not matching_state.get("last_results"):
-
         # Try cache first
         cached = await get_cached_jobs(skill, city)
 
@@ -468,16 +491,25 @@ async def handle_matching_message(
     all_jobs = matching_state["last_results"]
 
     if intent == "yes":
-        # Worker wants this job
+        # Worker wants this job — delegate to Application Agent
         selected_job = all_jobs[current_index - 1]
-        await save_application(worker_id, selected_job.get("id", ""))
+        worker_profile_data = await get_worker_profile(worker_id) or profile_data
 
+        confirmation, application_id = await handle_job_application(
+            worker_id=worker_id,
+            phone_number=phone_number,
+            job=selected_job,
+            worker_profile=worker_profile_data,
+            language=language,
+        )
+
+        # Offer to continue looking at more jobs
         if language == "hi":
-            response = f"बढ़िया! आपकी अर्जी डाल दी गई है। नियोक्ता को आपकी प्रोफाइल भेज दी है। क्या आप और भी नौकरियां देखना चाहते हैं?"
+            response = f"{confirmation} क्या आप और भी नौकरियां देखना चाहते हैं?"
         else:
-            response = "Great! Your application has been submitted. The employer has been sent your profile. Would you like to see more jobs?"
+            response = f"{confirmation} Would you like to see more jobs?"
 
-        # Continue to next job
+        # Advance index so next "no" shows the job after the one just applied to
         session["matching"]["current_job_index"] = current_index
 
     elif intent == "no" or intent == "other":
@@ -486,11 +518,15 @@ async def handle_matching_message(
             if language == "hi":
                 response = "आपने सभी उपलब्ध नौकरियां देख ली हैं। क्या मैं नई नौकरियां ढूंढूँ?"
             else:
-                response = "You've seen all available jobs. Should I search for new ones?"
+                response = (
+                    "You've seen all available jobs. Should I search for new ones?"
+                )
         else:
             next_job = all_jobs[current_index]
             session["matching"]["current_job_index"] = current_index + 1
-            response = await describe_job_in_language(next_job, language, current_index + 1)
+            response = await describe_job_in_language(
+                next_job, language, current_index + 1
+            )
 
     elif intent == "details":
         # Answer question about current job

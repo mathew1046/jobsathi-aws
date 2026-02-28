@@ -1,95 +1,152 @@
 // hooks/useVoice.js
-// Custom React hook that handles:
-//   1. Requesting microphone permission
-//   2. Recording audio when user holds the button
-//   3. Sending audio to the backend
-//   4. Receiving and playing the response audio
-//   5. Returning state for the UI to display
+// Core voice interaction hook for JobSathi.
+//
+// Manages the full voice pipeline:
+//   1. Microphone permission request
+//   2. Hold-to-record audio capture (MediaRecorder API)
+//   3. Live audio level analysis via Web Audio API AnalyserNode
+//      → passed to MicButton for the waveform visualizer
+//   4. Send audio blob to backend POST /api/message
+//   5. Decode and play base64 MP3 response (Web Audio API)
+//   6. Session persistence across page reloads (localStorage)
+//   7. Profile and progress state tracking
+//
+// Design note: This hook is the only place in the app that touches
+// raw audio APIs. Components only see clean state + callbacks.
 
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 
-const API_BASE = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+const API_BASE = process.env.REACT_APP_API_URL || '';
 
 export function useVoice(phoneNumber) {
-  const [isRecording, setIsRecording] = useState(false);
+  // ── Recording state ─────────────────────────────────────────────────────
+  const [isRecording, setIsRecording]   = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [error, setError] = useState(null);
+  const [isPlaying, setIsPlaying]       = useState(false);
+  const [error, setError]               = useState(null);
+
+  // ── Conversation content ────────────────────────────────────────────────
   const [lastTranscript, setLastTranscript] = useState('');
-  const [lastResponse, setLastResponse] = useState('');
-  const [progress, setProgress] = useState({ questions_answered: 0, total: 20, percent: 0 });
+  const [lastResponse, setLastResponse]     = useState('');
+  const [lastAudioBase64, setLastAudioBase64] = useState('');
+
+  // ── App state ────────────────────────────────────────────────────────────
+  const [progress, setProgress]           = useState({ questions_answered: 0, total: 20, percent: 0 });
   const [profileComplete, setProfileComplete] = useState(false);
-  const [currentAgent, setCurrentAgent] = useState('onboarding');
+  const [currentAgent, setCurrentAgent]   = useState('onboarding');
+  const [language, setLanguage]           = useState('hi');
+  const [profile, setProfile]             = useState(null);
 
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef = useRef([]);
-  const audioContextRef = useRef(null);
-  const sessionIdRef = useRef(localStorage.getItem('jobsathi_session_id'));
+  // ── Refs ─────────────────────────────────────────────────────────────────
+  const mediaRecorderRef  = useRef(null);
+  const audioChunksRef    = useRef([]);
+  const audioContextRef   = useRef(null);
+  const analyserRef       = useRef(null);    // ← passed to MicButton for waveform
+  const sourceNodeRef     = useRef(null);    // current playing audio source
+  const sessionIdRef      = useRef(localStorage.getItem('jobsathi_session_id') || '');
 
-  // ── Start Recording ──────────────────────────────────────────────────────
+  // ── Restore session on mount ──────────────────────────────────────────
+  useEffect(() => {
+    if (!phoneNumber) return;
+    const savedSessionId = localStorage.getItem('jobsathi_session_id');
+    if (savedSessionId) {
+      sessionIdRef.current = savedSessionId;
+    }
+  }, [phoneNumber]);
+
+  // ── Ensure AudioContext exists ────────────────────────────────────────
+  const getAudioContext = useCallback(() => {
+    if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    // Resume if suspended (browser autoplay policy)
+    if (audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume();
+    }
+    return audioContextRef.current;
+  }, []);
+
+  // ── Start Recording ───────────────────────────────────────────────────
   const startRecording = useCallback(async () => {
+    if (isProcessing || isPlaying) return;
     setError(null);
 
+    // Stop any currently playing audio immediately when user starts speaking
+    if (sourceNodeRef.current) {
+      try { sourceNodeRef.current.stop(); } catch {}
+      sourceNodeRef.current = null;
+      setIsPlaying(false);
+    }
+
     try {
-      // Request microphone access
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          sampleRate: 16000,  // 16kHz is ideal for Transcribe
+          sampleRate: 16000,   // 16kHz — ideal for Amazon Transcribe
+          channelCount: 1,     // Mono — reduces file size by 50%
         }
       });
 
-      // MediaRecorder captures audio as webm/opus
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'audio/webm;codecs=opus'
-      });
+      // ── Set up audio analyser for waveform visualizer ─────────────────
+      const ctx = getAudioContext();
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 64;
+      analyser.smoothingTimeConstant = 0.8;
+      source.connect(analyser);
+      analyserRef.current = analyser;
 
+      // ── MediaRecorder: collect audio chunks ───────────────────────────
+      // Try opus/webm first (best quality+size), fallback to webm
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : 'audio/webm';
+
+      const mediaRecorder = new MediaRecorder(stream, { mimeType });
       audioChunksRef.current = [];
 
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
       };
 
       mediaRecorderRef.current = mediaRecorder;
-      mediaRecorder.start(100);  // collect chunks every 100ms
+      mediaRecorder.start(100);  // chunk every 100ms — smooth waveform
       setIsRecording(true);
 
     } catch (err) {
-      if (err.name === 'NotAllowedError') {
-        setError('Microphone permission denied. Please allow microphone access and try again.');
-      } else {
-        setError('Could not start recording: ' + err.message);
-      }
+      const msg = err.name === 'NotAllowedError'
+        ? 'Microphone permission denied. Please allow microphone access.'
+        : `Could not start recording: ${err.message}`;
+      setError(msg);
     }
-  }, []);
+  }, [isProcessing, isPlaying, getAudioContext]);
 
-  // ── Stop Recording and Send to Backend ──────────────────────────────────
+  // ── Stop Recording → Send to Backend ─────────────────────────────────
   const stopRecording = useCallback(() => {
-    if (!mediaRecorderRef.current || !isRecording) return;
+    const recorder = mediaRecorderRef.current;
+    if (!recorder || recorder.state === 'inactive') return;
 
-    const mediaRecorder = mediaRecorderRef.current;
-
-    mediaRecorder.onstop = async () => {
+    recorder.onstop = async () => {
       setIsRecording(false);
       setIsProcessing(true);
 
-      // Stop all tracks (releases microphone)
-      mediaRecorder.stream.getTracks().forEach(track => track.stop());
+      // Disconnect analyser and stop mic stream
+      if (analyserRef.current) {
+        analyserRef.current.disconnect();
+        analyserRef.current = null;
+      }
+      recorder.stream.getTracks().forEach(t => t.stop());
 
-      // Build audio blob
       const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
 
-      if (audioBlob.size < 1000) {
-        setError('Recording too short. Please hold the button and speak.');
+      if (audioBlob.size < 800) {
+        setError('Recording too short — hold the button while speaking.');
         setIsProcessing(false);
         return;
       }
 
       try {
-        // Build form data
         const formData = new FormData();
         formData.append('audio', audioBlob, 'recording.webm');
         formData.append('phone_number', phoneNumber);
@@ -97,98 +154,130 @@ export function useVoice(phoneNumber) {
           formData.append('session_id', sessionIdRef.current);
         }
 
-        // Send to backend
-        const response = await fetch(`${API_BASE}/api/message`, {
+        const res = await fetch(`${API_BASE}/api/message`, {
           method: 'POST',
           body: formData,
         });
 
-        if (!response.ok) {
-          throw new Error(`Server error: ${response.status}`);
+        if (!res.ok) {
+          const detail = await res.text();
+          throw new Error(`Server error ${res.status}: ${detail}`);
         }
 
-        const data = await response.json();
+        const data = await res.json();
 
-        // Save session ID for continuity
+        // ── Persist session ──────────────────────────────────────────────
         if (data.session_id) {
           sessionIdRef.current = data.session_id;
           localStorage.setItem('jobsathi_session_id', data.session_id);
         }
 
-        // Update state from response
+        // ── Update state ─────────────────────────────────────────────────
         setLastTranscript(data.transcribed_input || '');
         setLastResponse(data.text || '');
+        setLastAudioBase64(data.audio_base64 || '');
         setProgress(data.progress || { questions_answered: 0, total: 20, percent: 0 });
         setProfileComplete(data.profile_complete || false);
         setCurrentAgent(data.agent || 'onboarding');
+        if (data.language) setLanguage(data.language);
+        if (data.profile) setProfile(data.profile);
 
-        // Play the audio response
+        // ── Auto-play audio response ────────────────────────────────────
         if (data.audio_base64) {
-          await playAudioBase64(data.audio_base64);
+          setIsProcessing(false);
+          await playAudio(data.audio_base64);
         }
 
       } catch (err) {
-        setError('Failed to process your message: ' + err.message);
-        console.error('Voice processing error:', err);
+        setError(`Failed to process your message: ${err.message}`);
+        console.error('[useVoice] Error:', err);
       } finally {
         setIsProcessing(false);
       }
     };
 
-    mediaRecorder.stop();
-  }, [isRecording, phoneNumber]);
+    recorder.stop();
+  }, [phoneNumber]);
 
-  // ── Play Audio Response ───────────────────────────────────────────────────
-  const playAudioBase64 = useCallback(async (base64Audio) => {
+  // ── Play Audio (base64 MP3) ───────────────────────────────────────────
+  const playAudio = useCallback(async (base64Audio) => {
+    if (!base64Audio) return;
     setIsPlaying(true);
+
     try {
-      // Decode base64 to ArrayBuffer
-      const binaryString = atob(base64Audio);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
+      // Decode base64 → ArrayBuffer
+      const binary = atob(base64Audio);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+      const ctx = getAudioContext();
+      const audioBuffer = await ctx.decodeAudioData(bytes.buffer);
+
+      // Stop previous if still playing
+      if (sourceNodeRef.current) {
+        try { sourceNodeRef.current.stop(); } catch {}
       }
 
-      // Create AudioContext if needed
-      if (!audioContextRef.current) {
-        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-      }
-
-      const audioContext = audioContextRef.current;
-
-      // Decode and play
-      const audioBuffer = await audioContext.decodeAudioData(bytes.buffer);
-      const source = audioContext.createBufferSource();
+      const source = ctx.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(audioContext.destination);
-
-      source.onended = () => setIsPlaying(false);
+      source.connect(ctx.destination);
+      source.onended = () => {
+        setIsPlaying(false);
+        sourceNodeRef.current = null;
+      };
       source.start(0);
+      sourceNodeRef.current = source;
 
     } catch (err) {
-      console.error('Audio playback error:', err);
+      console.error('[useVoice] Playback error:', err);
       setIsPlaying(false);
     }
+  }, [getAudioContext]);
+
+  // ── Replay last response ──────────────────────────────────────────────
+  const replayLastResponse = useCallback(() => {
+    if (lastAudioBase64) playAudio(lastAudioBase64);
+  }, [lastAudioBase64, playAudio]);
+
+  // ── Load profile from API ─────────────────────────────────────────────
+  const loadProfile = useCallback(async (phone) => {
+    if (!phone) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/profile/${encodeURIComponent(phone)}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.profile_exists !== false) setProfile(data);
+      }
+    } catch {}
   }, []);
 
   return {
-    // Recording controls
+    // Controls
     startRecording,
     stopRecording,
+    replayLastResponse,
+    loadProfile,
+    playAudio,
 
-    // State
+    // Recording state
     isRecording,
     isProcessing,
     isPlaying,
     error,
 
-    // Content
+    // Voice pipeline output
     lastTranscript,
     lastResponse,
+    lastAudioBase64,
 
-    // Progress
+    // App state
     progress,
     profileComplete,
     currentAgent,
+    language,
+    profile,
+
+    // Audio analyser for waveform (passed to MicButton)
+    analyserNode: analyserRef.current,
   };
 }
