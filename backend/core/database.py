@@ -133,6 +133,29 @@ CREATE TABLE IF NOT EXISTS applications (
     updated_at      TIMESTAMP DEFAULT NOW()
 );
 
+-- ─── Onboarding Questions Catalogue ──────────────────────────────────────────
+-- Master list of the 20 onboarding questions + all language translations.
+-- Seeded once; read at runtime to pick the right language for each worker.
+
+CREATE TABLE IF NOT EXISTS onboarding_questions (
+    id              SERIAL PRIMARY KEY,
+    question_index  INTEGER UNIQUE NOT NULL,   -- 0-19, matches ONBOARDING_QUESTIONS list
+    field_key       VARCHAR(100) NOT NULL,      -- DB column this answer maps to
+    extraction_hint TEXT NOT NULL,             -- instruction sent to Bedrock for extraction
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- One row per (question, language) pair — 20 questions × 10 languages = 200 rows
+CREATE TABLE IF NOT EXISTS question_translations (
+    id              SERIAL PRIMARY KEY,
+    question_id     INTEGER REFERENCES onboarding_questions(id) ON DELETE CASCADE,
+    language_code   VARCHAR(10) NOT NULL,      -- 'hi', 'ta', 'te', 'mr', 'bn', 'gu', 'kn', 'pa', 'ml', 'en'
+    language_name   VARCHAR(50) NOT NULL,      -- 'Hindi', 'Tamil', etc.
+    question_text   TEXT NOT NULL,             -- the question in that language
+    created_at      TIMESTAMP DEFAULT NOW(),
+    UNIQUE (question_id, language_code)
+);
+
 -- Indexes for fast queries
 CREATE INDEX IF NOT EXISTS idx_workers_phone ON workers(phone_number);
 CREATE INDEX IF NOT EXISTS idx_profiles_worker ON worker_profiles(worker_id);
@@ -142,6 +165,8 @@ CREATE INDEX IF NOT EXISTS idx_conversations_worker ON conversations(worker_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_city ON jobs_cache(city);
 CREATE INDEX IF NOT EXISTS idx_applications_worker ON applications(worker_id);
+CREATE INDEX IF NOT EXISTS idx_qtrans_question ON question_translations(question_id);
+CREATE INDEX IF NOT EXISTS idx_qtrans_language ON question_translations(language_code);
 """
 
 
@@ -155,6 +180,7 @@ async def create_all_tables():
 
 # ─── Helper Queries ───────────────────────────────────────────────────────────
 
+
 async def get_or_create_worker(phone_number: str) -> dict:
     """
     Returns existing worker or creates new one.
@@ -165,20 +191,20 @@ async def get_or_create_worker(phone_number: str) -> dict:
         # Try to get existing worker
         row = await conn.fetchrow(
             "SELECT id, phone_number, created_at FROM workers WHERE phone_number = $1",
-            phone_number
+            phone_number,
         )
         if row:
             # Update last_active
             await conn.execute(
                 "UPDATE workers SET last_active = NOW() WHERE phone_number = $1",
-                phone_number
+                phone_number,
             )
             return dict(row)
 
         # Create new worker
         row = await conn.fetchrow(
             "INSERT INTO workers (phone_number) VALUES ($1) RETURNING id, phone_number, created_at",
-            phone_number
+            phone_number,
         )
         return dict(row)
 
@@ -188,8 +214,7 @@ async def get_worker_profile(worker_id: str) -> Optional[dict]:
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM worker_profiles WHERE worker_id = $1",
-            worker_id
+            "SELECT * FROM worker_profiles WHERE worker_id = $1", worker_id
         )
         return dict(row) if row else None
 
@@ -200,7 +225,7 @@ async def save_conversation_turn(
     role: str,
     content: str,
     agent_name: str,
-    audio_s3_key: str = None
+    audio_s3_key: str = None,
 ):
     """
     Saves every single turn to the DB immediately.
@@ -208,26 +233,96 @@ async def save_conversation_turn(
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("""
+        await conn.execute(
+            """
             INSERT INTO conversations
                 (worker_id, session_id, role, content, agent_name, audio_s3_key)
             VALUES ($1, $2, $3, $4, $5, $6)
-        """, worker_id, session_id, role, content, agent_name, audio_s3_key)
+        """,
+            worker_id,
+            session_id,
+            role,
+            content,
+            agent_name,
+            audio_s3_key,
+        )
 
 
-async def get_recent_conversation(worker_id: str, session_id: str, limit: int = 10) -> list:
+async def get_recent_conversation(
+    worker_id: str, session_id: str, limit: int = 10
+) -> list:
     """
     Loads the last N turns of a conversation for context.
     Bedrock needs conversation history to maintain context.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("""
+        rows = await conn.fetch(
+            """
             SELECT role, content, agent_name, created_at
             FROM conversations
             WHERE worker_id = $1 AND session_id = $2
             ORDER BY created_at DESC
             LIMIT $3
-        """, worker_id, session_id, limit)
+        """,
+            worker_id,
+            session_id,
+            limit,
+        )
         # Return in chronological order (oldest first)
         return [dict(r) for r in reversed(rows)]
+
+
+async def get_question_text(question_index: int, language_code: str) -> Optional[str]:
+    """
+    Fetches the translated question text from the question_translations table.
+    Falls back to English if the requested language is not found.
+    Falls back to None if the question_index doesn't exist at all.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT qt.question_text
+            FROM question_translations qt
+            JOIN onboarding_questions oq ON oq.id = qt.question_id
+            WHERE oq.question_index = $1 AND qt.language_code = $2
+            """,
+            question_index,
+            language_code,
+        )
+        if row:
+            return row["question_text"]
+
+        # Fallback to English
+        row = await conn.fetchrow(
+            """
+            SELECT qt.question_text
+            FROM question_translations qt
+            JOIN onboarding_questions oq ON oq.id = qt.question_id
+            WHERE oq.question_index = $1 AND qt.language_code = 'en'
+            """,
+            question_index,
+        )
+        return row["question_text"] if row else None
+
+
+async def get_all_questions_for_language(language_code: str) -> list:
+    """
+    Returns all 20 questions in the requested language, ordered by question_index.
+    Used by tests and the onboarding agent to pre-load the question set.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT oq.question_index, oq.field_key, oq.extraction_hint,
+                   qt.question_text, qt.language_code
+            FROM onboarding_questions oq
+            JOIN question_translations qt
+              ON oq.id = qt.question_id AND qt.language_code = $1
+            ORDER BY oq.question_index
+            """,
+            language_code,
+        )
+        return [dict(r) for r in rows]
