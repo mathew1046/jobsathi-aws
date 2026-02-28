@@ -321,7 +321,11 @@ async def fetch_jobs_adzuna(
         jobs.append(
             {
                 "source": "adzuna",
-                "external_id": str(job.get("id", "")),
+                "external_id": str(job.get("id")) if job.get("id") else _fallback_external_id(
+                    job.get("title", ""),
+                    job.get("company", {}).get("display_name", ""),
+                    job.get("location", {}).get("display_name", ""),
+                ),
                 "title": job.get("title", ""),
                 "company": job.get("company", {}).get("display_name", ""),
                 "location": job.get("location", {}).get("display_name", ""),
@@ -389,7 +393,11 @@ async def fetch_jobs_jooble(
         jobs.append(
             {
                 "source": "jooble",
-                "external_id": str(job.get("id", "")),
+                "external_id": str(job.get("id")) if job.get("id") else _fallback_external_id(
+                    job.get("title", ""),
+                    job.get("company", ""),
+                    job.get("location", ""),
+                ),
                 "title": job.get("title", ""),
                 "company": job.get("company", ""),
                 "location": job.get("location", ""),
@@ -521,6 +529,12 @@ def _serp_job_id(job: dict) -> str:
     return hashlib.md5(raw.encode()).hexdigest()[:24]
 
 
+def _fallback_external_id(title: str, company: str, location: str) -> str:
+    """Generate a stable fingerprint ID when the upstream API provides no job ID."""
+    raw = f"{title}|{company}|{location}"
+    return hashlib.md5(raw.encode()).hexdigest()[:24]
+
+
 def _serp_description(job: dict) -> str:
     """Assemble a description string from SerpAPI's highlights structure."""
     parts = []
@@ -600,6 +614,10 @@ async def get_cached_jobs(skill: str, city: str, state: str = "") -> List[dict]:
         alt_term = SKILL_TO_SEARCH_TERMS.get(skill, [skill_term])[0]
         location_clause = city or state
 
+        if not location_clause:
+            print(f"get_cached_jobs: skipping query for skill='{skill}' — no city or state provided")
+            return []
+
         rows = await conn.fetch(
             """
             SELECT *
@@ -631,7 +649,7 @@ async def fetch_all_jobs(
     Fetch jobs from all three APIs concurrently.
     If city returns fewer than MIN_RESULTS, automatically re-runs at state level.
 
-    Returns a deduplicated, scored list sorted by match_score descending.
+    Returns a deduplicated list of jobs from all sources (order not guaranteed).
     """
     # ── City-level fetch ──
     adzuna_t = fetch_jobs_adzuna(skill, city, state, min_wage)
@@ -675,8 +693,6 @@ async def describe_job_in_language(job: dict, language: str, position: int) -> s
     listing. This is the key UX difference — workers respond to warmth, not
     corporate copy.
     """
-    bedrock = get_bedrock_client()
-
     salary_info = ""
     if job.get("salary_min"):
         if job.get("salary_max") and job["salary_max"] != job["salary_min"]:
@@ -961,7 +977,6 @@ async def handle_matching_message(
         # Give more detail about the current job, then ask again
         desc = shown_job.get("description", "")
         company = shown_job.get("company", "")
-        url = shown_job.get("url", "")
         sal_min = shown_job.get("salary_min")
         sal_max = shown_job.get("salary_max")
 
